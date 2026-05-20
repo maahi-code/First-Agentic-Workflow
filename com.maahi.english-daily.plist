@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+
+  <key>Label</key>
+  <string>com.maahi.english-daily</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/mahipalsingh/Development/Learning/Agentic Workflows/First Agentic Workflow/.venv/bin/python</string>
+    <string>/Users/mahipalsingh/Development/Learning/Agentic Workflows/First Agentic Workflow/run_daily.py</string>
+  </array>
+
+  <!-- Run every day at 08:00 local time -->
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key>
+    <integer>8</integer>
+    <key>Minute</key>
+    <integer>0</integer>
+  </dict>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/mahipalsingh/Development/Learning/Agentic Workflows/First Agentic Workflow</string>
+
+  <key>StandardOutPath</key>
+  <string>/Users/mahipalsingh/Development/Learning/Agentic Workflows/First Agentic Workflow/.tmp/daily.log</string>
+
+  <key>StandardErrorPath</key>
+  <string>/Users/mahipalsingh/Development/Learning/Agentic Workflows/First Agentic Workflow/.tmp/daily_error.log</string>
+
+  <!-- Start if the Mac was asleep when the scheduled time passed -->
+  <key>RunAtLoad</key>
+  <false/>
+
+</dict>
+</plist>
