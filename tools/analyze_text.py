@@ -121,8 +121,8 @@ ANALYSIS_TOOL = {
 }
 
 
-def build_system_prompt(user_level, target):
-    return f"""You are an experienced English language teacher specialized in helping {user_level} learners reach {target} level.
+def build_system_prompt(user_level, target, kind="writing"):
+    base = f"""You are an experienced English language teacher specialized in helping {user_level} learners reach {target} level.
 
 Your student is Maahi, an indie iOS developer. He's been writing in English daily for 74 days but never reviewing the entries — so the same mistakes repeat unnoticed. Your job is to close that feedback loop with structured, teaching-quality analysis.
 
@@ -177,14 +177,28 @@ Always include at least 1 strength — reinforcement matters more than correctio
 
 Submit your full analysis using the submit_analysis tool. Always include patterns, strengths, and naturalness_score (not just mistakes)."""
 
+    if kind == "speaking":
+        base += """
+
+## Speaking-specific instructions
+
+This entry is a raw speaking transcript — not edited text. The transcript may contain filler words and [UNCLEAR] markers. Use these as analytical data:
+
+- **Filler words** (um, uh, like, you know, so, right): If they appear more than roughly once every 10 words, flag it as mistake_type `naturalness`, tag `excessive-filler-words`. In the explanation, count how many times the filler appears and give a concrete tip for reducing it (e.g., deliberate pause instead of um).
+- **False starts** (I... I mean..., so... so what I...): flag as mistake_type `naturalness`, tag `false-start-pattern`. Explain that pausing silently is more fluent than filling.
+- **[UNCLEAR] markers**: Each one is a potential pronunciation or articulation issue. Flag as mistake_type `pronunciation`, tag `unclear-pronunciation-{brief context}` (e.g., `unclear-pronunciation-final-consonant`). In the explanation, name the likely sound being mispronounced and how to fix it.
+- **naturalness_score calibration for speaking**: 7+ = fluent with few fillers and clear articulation; 4–6 = B1 with noticeable hesitation or filler patterns; 1–3 = heavily interrupted speech."""
+
+    return base
+
 
 def analyze(text, kind, model, user_level, target):
     client = anthropic.Anthropic()
 
     response = client.messages.create(
         model=model,
-        max_tokens=4096,
-        system=build_system_prompt(user_level, target),
+        max_tokens=8192,
+        system=build_system_prompt(user_level, target, kind),
         tools=[ANALYSIS_TOOL],
         tool_choice={"type": "tool", "name": "submit_analysis"},
         messages=[

@@ -54,7 +54,7 @@ GOOGLE_SCOPES = [
 
 MISTAKES_HEADERS = [[
     "id", "date", "source", "source_ref", "original", "correction",
-    "mistake_type", "tag", "explanation", "severity", "cefr_focus", "created_at",
+    "mistake_type", "tag", "explanation", "severity", "cefr_focus", "created_at", "naturalness_score",
 ]]
 SUMMARIES_HEADERS = [["week_start", "total_entries", "top_3_tags", "naturalness_avg", "report_subject_line"]]
 
@@ -87,7 +87,7 @@ _reload_env()
 
 # ── Step 1: ffmpeg ────────────────────────────────────────────────────────────
 
-_step(1, 8, "Checking ffmpeg")
+_step(1, 9, "Checking ffmpeg")
 
 _found = subprocess.run(["which", "ffmpeg"], capture_output=True)
 if _found.returncode == 0:
@@ -102,7 +102,7 @@ else:
 
 # ── Step 2: Anthropic API key ─────────────────────────────────────────────────
 
-_step(2, 8, "Anthropic API key  (Claude — writing/speaking analysis)")
+_step(2, 9, "Anthropic API key  (Claude — writing/speaking analysis)")
 
 def _validate_anthropic(key):
     try:
@@ -139,7 +139,7 @@ else:
 
 # ── Step 3: Notion ────────────────────────────────────────────────────────────
 
-_step(3, 8, "Notion — Daily Writing Practice database")
+_step(3, 9, "Notion — Daily Writing Practice database")
 
 def _validate_notion(token, db_id):
     try:
@@ -200,7 +200,7 @@ else:
 
 # ── Step 4: Gemini API key ────────────────────────────────────────────────────
 
-_step(4, 8, "Gemini API key  (speaking video transcription)")
+_step(4, 9, "Gemini API key  (speaking video transcription)")
 
 def _validate_gemini(key):
     try:
@@ -233,7 +233,7 @@ else:
 
 # ── Step 5: Google Cloud OAuth ────────────────────────────────────────────────
 
-_step(5, 8, "Google Cloud OAuth  (Drive + Sheets + Gmail — one-time ever)")
+_step(5, 9, "Google Cloud OAuth  (Drive + Sheets + Gmail — one-time ever)")
 
 def _load_google_creds():
     from google.oauth2.credentials import Credentials
@@ -306,7 +306,7 @@ else:
 
 # ── Step 6: Create Google Sheet ───────────────────────────────────────────────
 
-_step(6, 8, "Creating Mistake Log Google Sheet")
+_step(6, 9, "Creating Mistake Log Google Sheet")
 
 from googleapiclient.discovery import build
 
@@ -331,7 +331,7 @@ else:
 
 # ── Step 7: Bootstrap Sheet headers ──────────────────────────────────────────
 
-_step(7, 8, "Writing Sheet column headers")
+_step(7, 9, "Writing Sheet column headers")
 
 _sheets_svc = build("sheets", "v4", credentials=google_creds)
 _existing = _sheets_svc.spreadsheets().values().get(
@@ -350,9 +350,20 @@ else:
         ).execute()
     _ok("Headers written to 'mistakes' and 'summaries' tabs")
 
+# Apply sheet formatting + create dashboard tab
+print("  Applying formatting and creating dashboard tab ...")
+_fmt = subprocess.run(
+    [sys.executable, "tools/sheets_format_sheet.py"],
+    capture_output=True, text=True, cwd=str(REPO_ROOT),
+)
+if _fmt.returncode == 0:
+    _ok("Sheet formatted — dashboard tab created")
+else:
+    print(f"  (formatting skipped: {_fmt.stderr.strip()[:80]})")
+
 # ── Step 8: Drive folder ──────────────────────────────────────────────────────
 
-_step(8, 8, "Google Drive — Speaking videos folder")
+_step(8, 9, "Google Drive — Speaking videos folder")
 
 _folder_id = _env_get("GDRIVE_VIDEO_FOLDER_ID")
 if _folder_id:
@@ -379,15 +390,63 @@ else:
         webbrowser.open(_folder["webViewLink"])
         print("  Move your speaking videos into that folder when you're ready.")
 
+# ── Step 9: Deploy launchd jobs ───────────────────────────────────────────────
+
+_step(9, 9, "Deploying automatic scheduler (launchd)")
+
+import shutil
+
+_launch_agents = Path.home() / "Library" / "LaunchAgents"
+_launch_agents.mkdir(parents=True, exist_ok=True)
+
+_daily_src  = REPO_ROOT / "com.maahi.english-daily.plist"
+_weekly_src = REPO_ROOT / "com.maahi.english-weekly.plist"
+_daily_dst  = _launch_agents / "com.maahi.english-daily.plist"
+_weekly_dst = _launch_agents / "com.maahi.english-weekly.plist"
+
+_already_loaded = subprocess.run(
+    ["launchctl", "list"], capture_output=True, text=True
+).stdout
+
+_daily_loaded  = "com.maahi.english-daily"  in _already_loaded
+_weekly_loaded = "com.maahi.english-weekly" in _already_loaded
+
+if _daily_loaded and _weekly_loaded:
+    _skip("launchd jobs already loaded")
+else:
+    if not _daily_src.exists() or not _weekly_src.exists():
+        _fail("plist files not found in project root — cannot install scheduler")
+    else:
+        shutil.copy2(_daily_src,  _daily_dst)
+        shutil.copy2(_weekly_src, _weekly_dst)
+
+        for _plist, _label in [
+            (_daily_dst,  "com.maahi.english-daily"),
+            (_weekly_dst, "com.maahi.english-weekly"),
+        ]:
+            _r = subprocess.run(
+                ["launchctl", "load", str(_plist)],
+                capture_output=True, text=True,
+            )
+            if _r.returncode == 0:
+                _ok(f"{_label} loaded")
+            else:
+                _fail(f"launchctl load failed: {_r.stderr.strip()[:80]}")
+
+        print()
+        print("  Schedule:")
+        print("    Daily  →  every morning at 08:00")
+        print("    Weekly →  every Sunday at 19:00")
+
 # ── Done ──────────────────────────────────────────────────────────────────────
 
 print()
 print("=" * 52)
-print("  Setup complete!")
+print("  Setup complete! The system runs itself from here.")
 print()
-print("  Verify M1 (once NOTION_TOKEN is set):")
-print("    python tools/notion_fetch_writing.py --since 2026-05-13")
+print("  Test now (optional):")
+print("    python run_daily.py")
 print()
-print("  Then start your first daily ingest:")
-print("    Tell Claude: 'run daily ingest'")
+print("  You will get an exercise email at ms4341547@gmail.com")
+print("  within ~1 minute if there is new writing in Notion.")
 print("=" * 52)

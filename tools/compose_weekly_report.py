@@ -10,7 +10,7 @@ Reads from .env:
 
 Usage:
     python tools/sheets_query_mistakes.py --since 2026-05-13 | \
-        python tools/compose_weekly_report.py --since 2026-05-13 --until 2026-05-19
+        python tools/compose_weekly_report.py --since 2026-05-13 --until 2026-05-19 --streak 5
 
 Output: HTML file at .tmp/report_<since>.html — prints the file path to stdout.
 """
@@ -68,12 +68,16 @@ REPORT_TOOL = {
                 },
                 "required": ["tag", "daily_exercise"],
             },
+            "b2_readiness_note": {
+                "type": "string",
+                "description": "1-2 sentences: an honest estimate of how close Maahi is to B2 based on this week's mistake patterns and naturalness score. Name exactly 1 specific gap he needs to close to reach B2.",
+            },
             "encouragement": {
                 "type": "string",
                 "description": "1 short, genuine sentence of encouragement. Not generic — reference something specific from the writing.",
             },
         },
-        "required": ["top_patterns", "strengths_note", "focus_next_week", "encouragement"],
+        "required": ["top_patterns", "strengths_note", "focus_next_week", "b2_readiness_note", "encouragement"],
     },
 }
 
@@ -117,12 +121,16 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
 <div class="stats">
   <div class="stat">
-    <div class="stat-value">{{ total_entries }}</div>
-    <div class="stat-label">entries analyzed</div>
+    <div class="stat-value">{{ days_written }}/7</div>
+    <div class="stat-label">days written</div>
   </div>
   <div class="stat">
     <div class="stat-value">{{ total_mistakes }}</div>
     <div class="stat-label">mistakes found</div>
+  </div>
+  <div class="stat">
+    <div class="stat-value">{{ streak }}</div>
+    <div class="stat-label">day streak 🔥</div>
   </div>
   <div class="stat">
     <div class="stat-value">{{ avg_per_entry }}</div>
@@ -153,6 +161,9 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   <p>{{ focus_next_week.daily_exercise }}</p>
 </div>
 
+<h2>B2 readiness</h2>
+<p style="font-size:14px;line-height:1.6;background:#f9fafb;border-radius:8px;padding:14px 16px;border:1px solid #e5e7eb;">{{ b2_readiness_note }}</p>
+
 <div class="encouragement">{{ encouragement }}</div>
 
 <div class="footer">
@@ -164,7 +175,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 </html>"""
 
 
-def get_report_data(mistakes, since, until):
+def get_report_data(mistakes, since, until, streak=0, longest_streak=0):
     counts = Counter(m["tag"] for m in mistakes)
     top_tags = [t for t, _ in counts.most_common(3)]
 
@@ -173,10 +184,14 @@ def get_report_data(mistakes, since, until):
         if m["tag"] not in examples:
             examples[m["tag"]] = m
 
+    days_written = len({m["date"] for m in mistakes if m.get("date")})
+
     summary = {
         "total_mistakes": len(mistakes),
         "total_entries": len({m["source_ref"] for m in mistakes}),
         "date_range": f"{since} to {until}",
+        "days_written_this_week": days_written,
+        "current_streak": streak,
         "top_patterns_raw": [
             {"tag": t, "count": counts[t], "example": {
                 "original": examples[t]["original"],
@@ -201,9 +216,12 @@ def get_report_data(mistakes, since, until):
         messages=[{
             "role": "user",
             "content": (
-                f"Here is Maahi's writing mistake data for the week of {since}:\n\n"
+                f"Here is Maahi's English learning data for the week of {since}:\n\n"
                 f"{json.dumps(summary, indent=2)}\n\n"
-                "Submit the report data using the submit_report_data tool."
+                f"He wrote on {days_written}/7 days this week. "
+                f"His current daily streak is {streak} day(s). "
+                "Submit the full report using the submit_report_data tool, "
+                "including an honest b2_readiness_note."
             ),
         }],
     )
@@ -220,6 +238,8 @@ def main():
     parser.add_argument("--since", required=True, help="Week start YYYY-MM-DD")
     parser.add_argument("--until", help="Week end YYYY-MM-DD (default today)")
     parser.add_argument("--mistakes-json", help="JSON file from sheets_query_mistakes (default stdin)")
+    parser.add_argument("--streak", type=int, default=0, help="Current daily streak count")
+    parser.add_argument("--longest-streak", type=int, default=0, help="Longest streak ever")
     args = parser.parse_args()
 
     until = args.until or datetime.now(timezone.utc).date().isoformat()
@@ -238,8 +258,9 @@ def main():
         print("No mistakes in date range — nothing to report", file=sys.stderr)
         sys.exit(0)
 
+    days_written = len({m["date"] for m in mistakes if m.get("date")})
     print(f"Composing report for {len(mistakes)} mistakes across {len({m['source_ref'] for m in mistakes})} entries...", file=sys.stderr)
-    data = get_report_data(mistakes, args.since, until)
+    data = get_report_data(mistakes, args.since, until, streak=args.streak, longest_streak=args.longest_streak)
 
     total_entries = len({m["source_ref"] for m in mistakes})
     avg = round(len(mistakes) / total_entries, 1) if total_entries else 0
@@ -251,9 +272,12 @@ def main():
         total_entries=total_entries,
         total_mistakes=len(mistakes),
         avg_per_entry=avg,
+        days_written=days_written,
+        streak=args.streak,
         top_patterns=data.get("top_patterns", []),
         strengths_note=data.get("strengths_note") or data.get("strengths") or "",
         focus_next_week=data.get("focus_next_week", {"tag": "", "daily_exercise": ""}),
+        b2_readiness_note=data.get("b2_readiness_note", ""),
         encouragement=data.get("encouragement", ""),
         generated_at=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
         sheet_url=f"https://docs.google.com/spreadsheets/d/{sheet_id}",

@@ -17,7 +17,7 @@ Output (stdout): JSON {appended: N, sheet_url, row_ids: [...]}.
 
 Column order (must match the bootstrap headers):
     id | date | source | source_ref | original | correction |
-    mistake_type | tag | explanation | severity | cefr_focus | created_at
+    mistake_type | tag | explanation | severity | cefr_focus | created_at | naturalness_score
 """
 import argparse
 import json
@@ -46,6 +46,7 @@ def build_rows(envelope):
     created_time = envelope.get("created_time") or ""
     date = created_time[:10] if created_time else datetime.now(timezone.utc).date().isoformat()
     now_iso = datetime.now(timezone.utc).isoformat()
+    naturalness = (envelope.get("analysis") or {}).get("naturalness_score", "")
 
     rows = []
     for m in mistakes:
@@ -62,6 +63,7 @@ def build_rows(envelope):
             m.get("severity", ""),
             m.get("cefr_focus", ""),
             now_iso,
+            naturalness,
         ])
     return rows
 
@@ -99,7 +101,7 @@ def main():
     service = build("sheets", "v4", credentials=creds)
     service.spreadsheets().values().append(
         spreadsheetId=sheet_id,
-        range="mistakes!A:L",
+        range="mistakes!A:M",
         valueInputOption="USER_ENTERED",
         insertDataOption="INSERT_ROWS",
         body={"values": rows},
