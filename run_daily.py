@@ -2,11 +2,15 @@
 """
 Daily ingest runner — called by launchd every morning at 08:00.
 
-Runs both writing and speaking ingests in sequence, following the
-workflow SOPs in workflows/daily_ingest_writing.md and
-workflows/daily_ingest_speaking.md.
+Writing pipeline:
+  1. Check yesterday's exercises
+  2. Fetch new Notion entries (IST midnight filter to catch late-night writing)
+  3. Skip already-processed pages (prevents double-send on re-runs)
+  4. Analyze mistakes via Claude
+  5. Append to Writing Journal doc
+  6. Send Writing Practice email (exercise feedback + mistakes + new exercises)
 
-After writing ingest: sends a targeted exercise email and updates streak.
+If no writing found → reminder email.
 """
 import json
 import os
@@ -19,6 +23,10 @@ REPO_ROOT = Path(__file__).resolve().parent
 PYTHON = sys.executable
 TODAY = datetime.now(timezone.utc).date().isoformat()
 
+STATE_DIR = REPO_ROOT / ".tmp" / "state"
+PENDING_EXERCISES_FILE = STATE_DIR / "pending_exercises.json"
+PROCESSED_PAGES_FILE = STATE_DIR / "processed_pages.json"
+
 
 def run(args, **kwargs):
     return subprocess.run([PYTHON] + args, capture_output=True, text=True, cwd=str(REPO_ROOT), **kwargs)
@@ -29,6 +37,15 @@ def log(msg):
     print(f"[{ts}] {msg}", flush=True)
 
 
+def get_env(key):
+    """Read a value from .env without importing dotenv at module level."""
+    from dotenv import load_dotenv
+    load_dotenv(REPO_ROOT / ".env", override=True)
+    return os.getenv(key, "").strip()
+
+
+# ── streak ────────────────────────────────────────────────────────────────────
+
 def update_streak():
     today = date.today().isoformat()
     yesterday = (date.today() - timedelta(days=1)).isoformat()
@@ -37,7 +54,7 @@ def update_streak():
     streak = int(run(["tools/state_get.py", "--key", "current_streak", "--default", "0"]).stdout.strip() or 0)
 
     if last == today:
-        return  # already updated this run
+        return
 
     new_streak = streak + 1 if last == yesterday else 1
     run(["tools/state_set.py", "--key", "current_streak", "--value", str(new_streak)])
@@ -50,84 +67,117 @@ def update_streak():
     log(f"Streak: {new_streak} day(s) (longest: {max(new_streak, longest)})")
 
 
-def send_daily_exercise(all_analyses):
-    mistakes = []
-    for a in all_analyses:
-        for m in (a.get("analysis") or {}).get("mistakes") or []:
-            m_copy = dict(m)
-            m_copy["date"] = TODAY
-            mistakes.append(m_copy)
+# ── processed page-id deduplication ──────────────────────────────────────────
 
-    if not mistakes:
-        log("No mistakes today — skipping exercise email")
-        return
-
-    tmp = REPO_ROOT / ".tmp"
-    tmp.mkdir(exist_ok=True)
-    mistakes_path = tmp / f"today_mistakes_{TODAY}.json"
-    mistakes_path.write_text(json.dumps(mistakes, ensure_ascii=False))
-
-    r = run(["tools/compose_daily_exercise.py", "--mistakes-json", str(mistakes_path), "--date", TODAY])
-    if r.returncode != 0:
-        log(f"Exercise compose failed: {r.stderr.strip()[:120]}")
-        return
-
-    html_path = r.stdout.strip()
-    if not html_path or not Path(html_path).exists():
-        log("Exercise compose returned no file path")
-        return
-
-    r2 = run([
-        "tools/send_gmail_report.py",
-        "--html-file", html_path,
-        "--subject", f"Today's English Practice — {TODAY}",
-    ])
-    if r2.returncode == 0:
-        log(f"Daily exercise email sent ({len(mistakes)} mistakes)")
-    else:
-        log(f"Exercise email send failed: {r2.stderr.strip()[:120]}")
+def load_processed_page_ids():
+    if not PROCESSED_PAGES_FILE.exists():
+        return set()
+    try:
+        return set(json.loads(PROCESSED_PAGES_FILE.read_text()))
+    except Exception:
+        return set()
 
 
-def append_gdoc_review(all_analyses, kind):
-    mistakes = []
-    for a in all_analyses:
-        for m in (a.get("analysis") or {}).get("mistakes") or []:
-            m_copy = dict(m)
-            m_copy["date"] = TODAY
-            mistakes.append(m_copy)
+def save_processed_page_ids(new_ids):
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    existing = load_processed_page_ids()
+    combined = list(existing | new_ids)
+    # Cap at 500 to prevent unbounded growth
+    PROCESSED_PAGES_FILE.write_text(json.dumps(combined[-500:], ensure_ascii=False))
 
-    if not mistakes:
-        log("No mistakes — skipping doc review")
-        return
 
-    tmp = REPO_ROOT / ".tmp"
-    tmp.mkdir(exist_ok=True)
-    mistakes_path = tmp / f"today_mistakes_{TODAY}.json"
-    mistakes_path.write_text(json.dumps(mistakes, ensure_ascii=False))
+# ── pending exercise state ────────────────────────────────────────────────────
 
+def load_pending_exercises():
+    if not PENDING_EXERCISES_FILE.exists():
+        return None
+    try:
+        return json.loads(PENDING_EXERCISES_FILE.read_text())
+    except Exception:
+        return None
+
+
+def save_pending_exercises(page_id, exercises_list):
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    PENDING_EXERCISES_FILE.write_text(json.dumps({
+        "page_id": page_id,
+        "date": TODAY,
+        "exercises": exercises_list,
+    }, ensure_ascii=False))
+
+
+def clear_pending_exercises():
+    PENDING_EXERCISES_FILE.unlink(missing_ok=True)
+
+
+# ── exercise checking ─────────────────────────────────────────────────────────
+
+def check_pending_exercises():
+    """Check yesterday's exercises. Returns (feedback_json_path | None, was_pending)."""
+    pending = load_pending_exercises()
+    if not pending:
+        return None, False
+
+    page_id = pending.get("page_id", "")
+    exercises = pending.get("exercises", [])
+    ex_date = pending.get("date", "")
+
+    if not page_id or not exercises:
+        clear_pending_exercises()
+        return None, False
+
+    log(f"Checking exercise answers for {ex_date} (page {page_id[:8]}...)")
     r = run([
-        "tools/gdoc_append_review.py",
-        "--mistakes-json", str(mistakes_path),
-        "--date", TODAY,
-        "--kind", kind,
+        "tools/check_exercises.py",
+        "--page-id", page_id,
+        "--exercises", json.dumps(exercises),
+        "--date", ex_date,
     ])
-    if r.returncode == 0:
-        result = json.loads(r.stdout.strip() or "{}")
-        log(f"Doc review appended → {result.get('doc_url', '?')}")
-    else:
-        log(f"Doc review failed: {r.stderr.strip()[:120]}")
+
+    clear_pending_exercises()
+
+    if r.returncode != 0:
+        log(f"Exercise check failed: {r.stderr.strip()[:120]}")
+        return None, True
+
+    try:
+        result = json.loads(r.stdout.strip())
+    except Exception:
+        log("Exercise check returned invalid JSON")
+        return None, True
+
+    if not result.get("found"):
+        log("No exercise answers found in yesterday's Notion page")
+        return None, True
+
+    n_correct = sum(1 for item in result.get("items", []) if item.get("correct"))
+    n_total = len(result.get("items", []))
+    log(f"Exercise check done: {n_correct}/{n_total} correct")
+
+    tmp = REPO_ROOT / ".tmp"
+    tmp.mkdir(exist_ok=True)
+    feedback_path = tmp / f"exercise_feedback_{ex_date}.json"
+    feedback_path.write_text(json.dumps(result, ensure_ascii=False))
+    return str(feedback_path), True
 
 
-def ingest_writing():
-    log("=== Writing ingest start ===")
+# ── writing pipeline ──────────────────────────────────────────────────────────
 
+def run_writing_pipeline():
+    log("=== Writing pipeline start ===")
+
+    # 1. Check yesterday's exercises
+    feedback_path, exercise_pending = check_pending_exercises()
+
+    # 2. Fetch from Notion
     r = run(["tools/state_get.py", "--key", "last_writing_sync", "--default", "2026-01-01"])
     since = r.stdout.strip() or "2026-01-01"
-    log(f"Since: {since}")
+    log(f"Writing since: {since}")
 
     r = run(["tools/notion_fetch_writing.py", "--since", since])
     if r.returncode != 0:
         log(f"ERROR fetching Notion: {r.stderr.strip()}")
+        _send_reminder_email()
         return
 
     try:
@@ -137,19 +187,31 @@ def ingest_writing():
         return
 
     if not entries:
-        log("No new writing entries — skipping.")
+        log("No new writing entries — sending reminder.")
+        _send_reminder_email()
         return
 
-    log(f"Found {len(entries)} new entries")
+    # 3. Filter out already-processed pages (prevents duplicate emails on re-runs)
+    processed_ids = load_processed_page_ids()
+    new_entries = [e for e in entries if e.get("page_id") not in processed_ids]
+    skipped = len(entries) - len(new_entries)
+    if skipped:
+        log(f"Skipping {skipped} already-processed page(s)")
+    if not new_entries:
+        log("All fetched entries already processed — sending reminder.")
+        _send_reminder_email()
+        return
+
+    log(f"Found {len(new_entries)} new entries")
     tmp = REPO_ROOT / ".tmp"
     tmp.mkdir(exist_ok=True)
-    total_appended = 0
     all_ok = True
-    all_analyses = []
+    analyses = []
 
-    for i, entry in enumerate(entries):
+    # 4. Analyze each entry
+    for i, entry in enumerate(new_entries):
         if not (entry.get("text") or "").strip():
-            log(f"  Entry {i+1} ({entry.get('title','?')}): empty text, skipping")
+            log(f"  Entry {i+1} ({entry.get('title','?')}): empty, skipping")
             continue
 
         entry_path = tmp / f"entry_daily_{i:02d}.json"
@@ -157,112 +219,186 @@ def ingest_writing():
 
         r = run(["tools/analyze_text.py", "--entry-json", str(entry_path), "--kind", "writing"])
         if r.returncode != 0:
-            log(f"  Entry {i+1} ({entry.get('title','?')}): analysis failed — {r.stderr.strip()[:100]}")
+            log(f"  Entry {i+1}: analysis failed — {r.stderr.strip()[:100]}")
             all_ok = False
             continue
 
-        analysis_result = json.loads(r.stdout)
-        all_analyses.append(analysis_result)
+        result = json.loads(r.stdout)
+        analyses.append(result)
+        n = len((result.get("analysis") or {}).get("mistakes") or [])
+        log(f"  Entry {i+1} ({entry.get('title','?')}): {n} mistakes")
 
-        r2 = run(["tools/sheets_append_mistakes.py", "--stdin"], input=r.stdout)
-        if r2.returncode != 0:
-            log(f"  Entry {i+1}: sheet append failed — {r2.stderr.strip()[:100]}")
-            all_ok = False
-            continue
-
-        try:
-            result = json.loads(r2.stdout)
-            n = result.get("appended", 0)
-            total_appended += n
-            log(f"  Entry {i+1} ({entry.get('title','?')}): {n} mistakes appended")
-        except Exception:
-            log(f"  Entry {i+1}: appended (count unknown)")
-
-    if all_ok:
-        run(["tools/state_set.py", "--key", "last_writing_sync", "--value", TODAY])
-        log(f"Sync date advanced to {TODAY}")
-        update_streak()
-        send_daily_exercise(all_analyses)
-        append_gdoc_review(all_analyses, "writing")
-
-    log(f"=== Writing ingest done — {total_appended} mistakes appended ===")
-
-
-def ingest_speaking():
-    log("=== Speaking ingest start ===")
-
-    r = run(["tools/state_get.py", "--key", "last_video_sync", "--default", "2026-01-01"])
-    since = r.stdout.strip() or "2026-01-01"
-    log(f"Since: {since}")
-
-    r = run(["tools/gdrive_list_videos.py", "--since", since])
-    if r.returncode != 0:
-        log(f"ERROR listing Drive videos: {r.stderr.strip()}")
+    if not all_ok:
+        log("Some entries failed — NOT advancing sync date")
         return
 
-    try:
-        videos = json.loads(r.stdout)
-    except json.JSONDecodeError:
-        log(f"ERROR parsing video list: {r.stdout[:200]}")
-        return
+    # Flatten mistakes
+    mistakes = []
+    for a in analyses:
+        for m in (a.get("analysis") or {}).get("mistakes") or []:
+            mc = dict(m)
+            mc["date"] = TODAY
+            mistakes.append(mc)
 
-    if not videos:
-        log("No new videos — skipping.")
-        return
+    # Compute average naturalness
+    scores = [
+        (a.get("analysis") or {}).get("naturalness_score")
+        for a in analyses
+        if (a.get("analysis") or {}).get("naturalness_score")
+    ]
+    avg_naturalness = round(sum(scores) / len(scores)) if scores else None
 
-    log(f"Found {len(videos)} new videos")
-    all_ok = True
-    all_analyses = []
+    # Advance sync date + streak + mark pages as processed
+    run(["tools/state_set.py", "--key", "last_writing_sync", "--value", TODAY])
+    log(f"Writing sync advanced to {TODAY}")
+    new_ids = {e.get("page_id") for e in new_entries if e.get("page_id")}
+    save_processed_page_ids(new_ids)
+    update_streak()
 
-    for v in videos:
-        file_id = v["file_id"]
-        name = v["name"]
-        log(f"  Processing: {name}")
+    # 5. Append to Writing Journal doc
+    if mistakes:
+        mistakes_path = tmp / f"today_mistakes_writing_{TODAY}.json"
+        mistakes_path.write_text(json.dumps(mistakes, ensure_ascii=False))
 
-        r = run(["tools/gdrive_download_video.py", "--file-id", file_id, "--name", name])
-        if r.returncode != 0:
-            log(f"    Download failed: {r.stderr.strip()[:100]}")
-            all_ok = False
-            continue
+        cmd = [
+            "tools/gdoc_append_review.py",
+            "--mistakes-json", str(mistakes_path),
+            "--date", TODAY,
+            "--kind", "writing",
+        ]
+        if avg_naturalness:
+            cmd += ["--naturalness", str(avg_naturalness)]
 
-        video_path = json.loads(r.stdout)["local_path"]
-
-        r = run(["tools/compress_video_to_audio.py", "--video-path", video_path])
-        if r.returncode != 0:
-            log(f"    Compression failed: {r.stderr.strip()[:100]}")
-            all_ok = False
-            Path(video_path).unlink(missing_ok=True)
-            continue
-
-        compress_out = json.loads(r.stdout)
-        audio_path = compress_out["output_path"]
-        ratio = compress_out.get("ratio", "?")
-        log(f"    Compressed {ratio}x smaller → analyzing with Gemini")
-
-        r = run(["tools/analyze_speaking_with_gemini.py", "--audio-path", audio_path, "--file-id", file_id])
-        if r.returncode != 0:
-            log(f"    Speaking analysis failed: {r.stderr.strip()[:100]}")
-            all_ok = False
+        r = run(cmd)
+        if r.returncode == 0:
+            doc_result = json.loads(r.stdout.strip() or "{}")
+            writing_doc_url = doc_result.get("doc_url", "")
+            log(f"Writing doc updated → {writing_doc_url}")
         else:
-            analysis_result = json.loads(r.stdout)
-            n = len((analysis_result.get("analysis") or {}).get("mistakes") or [])
-            score = (analysis_result.get("analysis") or {}).get("naturalness_score", "?")
-            log(f"    {n} issues found, naturalness score: {score}/10")
-            all_analyses.append(analysis_result)
+            log(f"Writing doc failed: {r.stderr.strip()[:120]}")
+            writing_doc_url = ""
+    else:
+        log("No mistakes — skipping writing doc")
+        writing_doc_url = _get_doc_url()
 
-        Path(video_path).unlink(missing_ok=True)
-        Path(audio_path).unlink(missing_ok=True)
+    # 6. Send Writing Practice email
+    _send_writing_email(mistakes, analyses, new_entries, feedback_path, exercise_pending, writing_doc_url)
 
-    if all_ok:
-        run(["tools/state_set.py", "--key", "last_video_sync", "--value", TODAY])
-        log(f"Sync date advanced to {TODAY}")
-        append_gdoc_review(all_analyses, "speaking")
+    log("=== Writing pipeline done ===")
 
-    log(f"=== Speaking ingest done — {len(all_analyses)} video(s) analyzed ===")
 
+def _send_writing_email(mistakes, analyses, entries, feedback_path, exercise_pending, doc_url):
+    if not mistakes:
+        log("No writing mistakes — skipping writing email")
+        return
+
+    tmp = REPO_ROOT / ".tmp"
+    tmp.mkdir(exist_ok=True)
+    mistakes_path = tmp / f"today_mistakes_writing_{TODAY}.json"
+    mistakes_path.write_text(json.dumps(mistakes, ensure_ascii=False))
+
+    if not doc_url:
+        doc_url = _get_doc_url()
+
+    cmd = [
+        "tools/compose_daily_exercise.py",
+        "--mistakes-json", str(mistakes_path),
+        "--date", TODAY,
+    ]
+    if feedback_path:
+        cmd += ["--exercise-feedback-json", feedback_path]
+    if exercise_pending and not feedback_path:
+        cmd += ["--exercise-feedback-pending"]
+    if doc_url:
+        cmd += ["--doc-url", doc_url]
+
+    r = run(cmd)
+    if r.returncode != 0:
+        log(f"Writing email compose failed: {r.stderr.strip()[:120]}")
+        return
+
+    html_path = r.stdout.strip()
+    if not html_path or not Path(html_path).exists():
+        log("Writing email compose returned no file")
+        return
+
+    r2 = run([
+        "tools/send_gmail_report.py",
+        "--html-file", html_path,
+        "--subject", f"Writing Practice — {TODAY} ({len(mistakes)} mistakes)",
+    ])
+    if r2.returncode == 0:
+        log(f"Writing email sent ({len(mistakes)} mistakes)")
+    else:
+        log(f"Writing email send failed: {r2.stderr.strip()[:120]}")
+
+    # Save exercises for tomorrow's check (use most recent entry's page_id)
+    sidecar = REPO_ROOT / ".tmp" / f"exercise_data_{TODAY}.json"
+    exercises_list = []
+    try:
+        exercises_list = json.loads(sidecar.read_text()).get("exercises", [])
+    except Exception:
+        pass
+
+    first_page_id = ""
+    for entry in reversed(entries):
+        if entry.get("page_id"):
+            first_page_id = entry["page_id"]
+            break
+
+    if exercises_list and first_page_id:
+        save_pending_exercises(first_page_id, exercises_list)
+        log(f"Saved {len(exercises_list)} exercises for tomorrow's check")
+
+
+def _send_reminder_email():
+    streak = run(["tools/state_get.py", "--key", "current_streak", "--default", "0"]).stdout.strip() or "0"
+    html = f"""<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<style>
+  body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+         max-width: 480px; margin: 0 auto; padding: 20px; color: #1a1a1a; }}
+  .box {{ background: #fef9c3; border: 1px solid #fbbf24; border-radius: 8px;
+          padding: 20px 24px; }}
+  h1 {{ font-size: 17px; margin: 0 0 8px; color: #713f12; }}
+  p  {{ font-size: 14px; color: #374151; margin: 8px 0 0; line-height: 1.6; }}
+  .streak {{ font-size: 13px; color: #92400e; margin-top: 12px; font-weight: 600; }}
+</style>
+</head>
+<body>
+<div class="box">
+  <h1>No writing found today</h1>
+  <p>Your English agent ran at 8 AM and found nothing new in Notion. Write something — even a few sentences counts!</p>
+  <p class="streak">Current streak: {streak} day(s). Don't break it.</p>
+</div>
+</body>
+</html>"""
+
+    tmp = REPO_ROOT / ".tmp"
+    tmp.mkdir(exist_ok=True)
+    path = tmp / f"reminder_{TODAY}.html"
+    path.write_text(html, encoding="utf-8")
+
+    r = run(["tools/send_gmail_report.py", "--html-file", str(path),
+             "--subject", f"Write something today — {TODAY}"])
+    if r.returncode == 0:
+        log("Reminder email sent")
+    else:
+        log(f"Reminder email failed: {r.stderr.strip()[:120]}")
+
+
+# ── helpers ───────────────────────────────────────────────────────────────────
+
+def _get_doc_url():
+    doc_id = get_env("GDOC_WRITING_ID") or get_env("GDOC_JOURNAL_ID")
+    return f"https://docs.google.com/document/d/{doc_id}" if doc_id else ""
+
+
+# ── entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     log(f"Daily ingest starting — {TODAY}")
-    ingest_writing()
-    ingest_speaking()
+    run_writing_pipeline()
     log("Daily ingest complete")

@@ -165,7 +165,9 @@ def main():
     except ValueError:
         print(f"--since must be YYYY-MM-DD, got {args.since!r}", file=sys.stderr)
         sys.exit(1)
-    since_iso = f"{args.since}T00:00:00.000Z"
+    # Use IST midnight (UTC+05:30) so entries written late at night IST
+    # (which land on the previous UTC date) are still captured.
+    since_iso = f"{args.since}T00:00:00+05:30"
 
     # Pin to 2022-06-28: the databases.query endpoint was moved in Notion API 2025-09-03
     client = Client(auth=token, notion_version="2022-06-28")

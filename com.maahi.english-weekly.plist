@@ -9,8 +9,8 @@
 
   <key>ProgramArguments</key>
   <array>
-    <string>/Users/mahipalsingh/Development/Learning/Agentic Workflows/First Agentic Workflow/.venv/bin/python</string>
-    <string>/Users/mahipalsingh/Development/Learning/Agentic Workflows/First Agentic Workflow/run_weekly.py</string>
+    <string>/Users/mahipalsingh/Development/Learning/Agentic Workflows/English Learning Agent/.venv/bin/python</string>
+    <string>/Users/mahipalsingh/Development/Learning/Agentic Workflows/English Learning Agent/run_weekly.py</string>
   </array>
 
   <!-- Run every Sunday at 19:00 local time -->
@@ -25,13 +25,13 @@
   </dict>
 
   <key>WorkingDirectory</key>
-  <string>/Users/mahipalsingh/Development/Learning/Agentic Workflows/First Agentic Workflow</string>
+  <string>/Users/mahipalsingh/Development/Learning/Agentic Workflows/English Learning Agent</string>
 
   <key>StandardOutPath</key>
-  <string>/Users/mahipalsingh/Development/Learning/Agentic Workflows/First Agentic Workflow/.tmp/weekly.log</string>
+  <string>/Users/mahipalsingh/Development/Learning/Agentic Workflows/English Learning Agent/.tmp/weekly.log</string>
 
   <key>StandardErrorPath</key>
-  <string>/Users/mahipalsingh/Development/Learning/Agentic Workflows/First Agentic Workflow/.tmp/weekly_error.log</string>
+  <string>/Users/mahipalsingh/Development/Learning/Agentic Workflows/English Learning Agent/.tmp/weekly_error.log</string>
 
   <key>RunAtLoad</key>
   <false/>
