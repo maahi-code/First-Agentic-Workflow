@@ -1,59 +1,71 @@
 # Workflow: Weekly Progress Report
 
 ## Objective
-Summarize the week's mistakes, compose an HTML report with Claude, and email it
-to Maahi. This closes the feedback loop — patterns become visible, not invisible.
+Every Sunday, summarize the past 7 days of mistakes, compose an HTML progress email
+with Claude, send it, and append a weekly summary to the Writing Journal Google Doc.
 
 ## When to run
-Every Sunday evening (automated via launchd after M8 setup).
+Every Sunday at 19:00 via launchd (`com.maahi.english-weekly.plist`).
+Can be triggered manually: `python run_weekly.py`
 
 ## Prerequisites
-- `GSHEET_MISTAKE_LOG_ID`, `ANTHROPIC_API_KEY`, `REPORT_TO_EMAIL` in `.env`
-- At least one week of ingested data in the Sheet
+- At least one week of daily runs so `.tmp/state/mistakes_history.json` has data
+- `ANTHROPIC_API_KEY`, `REPORT_TO_EMAIL` in `.env`
+- `token.json` present (Google OAuth)
+
+## Data source
+`run_daily.py` appends every mistake to `.tmp/state/mistakes_history.json` after
+each successful analysis. This is a flat JSON array of mistake objects, each with:
+`date`, `page_id`, `tag`, `original`, `correction`, `severity`, `cefr_focus`, etc.
+The file is capped at 90 days of history.
 
 ## Tools used (in order)
-1. `tools/sheets_query_mistakes.py` — fetch this week's mistakes from Sheet
-2. `tools/compose_weekly_report.py` — Claude summarizes + renders HTML
-3. `tools/send_gmail_report.py`     — sends the email via Gmail API
+1. `.tmp/state/mistakes_history.json` — filter to past 7 days
+2. `tools/compose_weekly_report.py`   — Claude summarizes + renders HTML email
+3. `tools/send_gmail_report.py`       — sends the email via Gmail API
+4. `tools/gdoc_append_review.py`      — appends weekly summary to Writing Journal doc
 
 ## Steps
 
-1. **Query this week's mistakes**
-   ```bash
-   SINCE=$(date -v-7d +%F)   # 7 days ago on macOS
-   UNTIL=$(date +%F)
-   python tools/sheets_query_mistakes.py --since "$SINCE" --until "$UNTIL" \
-     > .tmp/week_mistakes.json
+1. **Filter past 7 days from history**
+   ```python
+   week_mistakes = [m for m in all_mistakes if SINCE <= m["date"] <= UNTIL]
    ```
+   If empty → exit cleanly (nothing to report).
 
-2. **Compose the report** (one Claude Haiku call — ~$0.005)
+2. **Compose the report** (~$0.005 — one Claude Haiku call)
    ```bash
    python tools/compose_weekly_report.py \
      --since "$SINCE" --until "$UNTIL" \
-     --mistakes-json .tmp/week_mistakes.json
+     --mistakes-json .tmp/week_<since>.json \
+     --streak <N> --longest-streak <N>
    # → prints path like: .tmp/report_2026-05-13.html
    ```
+   Report contains: stats (days written, mistakes, streak), top 3 recurring patterns
+   with examples and teaching notes, what went well, focus for next week, B2
+   readiness estimate, encouragement.
 
 3. **Send the email**
    ```bash
    python tools/send_gmail_report.py \
-     --html-file .tmp/report_2026-05-13.html \
+     --html-file .tmp/report_<since>.html \
      --subject "English Learning — Week of $SINCE"
    ```
 
+4. **Append weekly summary to Google Doc**
+   ```bash
+   python tools/gdoc_append_review.py \
+     --mistakes-json .tmp/week_<since>.json \
+     --date "$SINCE:$UNTIL" --kind weekly
+   ```
+
 ## Expected output
-- An HTML email in Maahi's inbox with:
-  - Stats (entries analyzed, total mistakes, avg per entry)
-  - Top 3 recurring patterns with examples and teaching notes
-  - What went well this week
-  - One focused exercise for next week
-  - A short encouraging note
+- An HTML email with weekly stats, top 3 patterns, focus area, B2 readiness note.
+- Weekly summary appended to the Writing Journal Google Doc.
 
 ## Error handling
-- **0 mistakes for the week**: send a gentle nudge email instead of skipping silently.
-  Update the compose step to detect an empty array and send a "you didn't journal
-  this week" note (add this to compose_weekly_report.py when needed).
-- **Claude fails**: retry once. If still failing, the week's report is skipped
-  (the Sheet still has all the data — the analysis just isn't emailed).
-- **Gmail send fails**: retry once. If still failing, the HTML is saved in .tmp/
-  so it can be sent manually.
+- **No history file**: exit cleanly (daily pipeline hasn't run yet).
+- **0 mistakes this week**: exit cleanly (no data to report).
+- **Claude fails**: report skipped for the week; history is intact for next run.
+- **Gmail send fails**: HTML saved in `.tmp/` for manual send.
+- **Google Doc append fails**: logged, email still sent.

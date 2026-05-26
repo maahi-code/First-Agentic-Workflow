@@ -26,6 +26,7 @@ TODAY = datetime.now(timezone.utc).date().isoformat()
 STATE_DIR = REPO_ROOT / ".tmp" / "state"
 PENDING_EXERCISES_FILE = STATE_DIR / "pending_exercises.json"
 PROCESSED_PAGES_FILE = STATE_DIR / "processed_pages.json"
+MISTAKES_HISTORY_FILE = STATE_DIR / "mistakes_history.json"
 
 
 def run(args, **kwargs):
@@ -82,8 +83,22 @@ def save_processed_page_ids(new_ids):
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     existing = load_processed_page_ids()
     combined = list(existing | new_ids)
-    # Cap at 500 to prevent unbounded growth
     PROCESSED_PAGES_FILE.write_text(json.dumps(combined[-500:], ensure_ascii=False))
+
+
+def append_to_mistakes_history(mistakes):
+    """Append today's mistakes to the rolling 90-day history used by the weekly report."""
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    existing = []
+    if MISTAKES_HISTORY_FILE.exists():
+        try:
+            existing = json.loads(MISTAKES_HISTORY_FILE.read_text())
+        except Exception:
+            existing = []
+    combined = existing + mistakes
+    cutoff = (date.today() - timedelta(days=90)).isoformat()
+    combined = [r for r in combined if r.get("date", "") >= cutoff]
+    MISTAKES_HISTORY_FILE.write_text(json.dumps(combined, ensure_ascii=False))
 
 
 # ── pending exercise state ────────────────────────────────────────────────────
@@ -232,12 +247,14 @@ def run_writing_pipeline():
         log("Some entries failed — NOT advancing sync date")
         return
 
-    # Flatten mistakes
+    # Flatten mistakes (include page_id so weekly report can count unique entries)
     mistakes = []
     for a in analyses:
+        pid = a.get("page_id", "")
         for m in (a.get("analysis") or {}).get("mistakes") or []:
             mc = dict(m)
             mc["date"] = TODAY
+            mc["page_id"] = pid
             mistakes.append(mc)
 
     # Compute average naturalness
@@ -253,6 +270,9 @@ def run_writing_pipeline():
     log(f"Writing sync advanced to {TODAY}")
     new_ids = {e.get("page_id") for e in new_entries if e.get("page_id")}
     save_processed_page_ids(new_ids)
+    if mistakes:
+        append_to_mistakes_history(mistakes)
+        log(f"Appended {len(mistakes)} mistakes to history")
     update_streak()
 
     # 5. Append to Writing Journal doc

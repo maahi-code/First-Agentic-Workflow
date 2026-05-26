@@ -19,7 +19,6 @@ CREDENTIALS_FILE = REPO_ROOT / "credentials.json"
 TOKEN_FILE = REPO_ROOT / "token.json"
 
 SCOPES = [
-    "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive",
     "https://www.googleapis.com/auth/gmail.send",
 ]

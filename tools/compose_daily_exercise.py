@@ -191,9 +191,14 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
 <div class="encouragement">{{ encouragement }}</div>
 
+{% if doc_url %}
+<div style="margin: 20px 0;">
+  <a href="{{ doc_url }}" style="display:inline-block;background:#1e3a5f;color:#ffffff;padding:11px 22px;border-radius:6px;font-size:14px;font-weight:600;text-decoration:none;">View Your Writing Journal →</a>
+</div>
+{% endif %}
+
 <div class="footer">
-  Generated {{ generated_at }}<br>
-  {% if doc_url %}<a href="{{ doc_url }}">View your English Learning Journal →</a>{% endif %}
+  Generated {{ generated_at }}
 </div>
 
 </body>
@@ -279,7 +284,7 @@ def main():
 
     doc_url = args.doc_url or ""
     if not doc_url:
-        doc_id = os.getenv("GDOC_JOURNAL_ID", "").strip()
+        doc_id = (os.getenv("GDOC_WRITING_ID", "") or os.getenv("GDOC_JOURNAL_ID", "")).strip()
         if doc_id:
             doc_url = f"https://docs.google.com/document/d/{doc_id}"
 

@@ -2,22 +2,28 @@
 
 ## Objective
 Pull new entries from the Notion "Daily Writing Practice" database, analyze each
-with Claude, and append the detected mistakes to the Mistake Log Google Sheet.
+with Claude, send a feedback email with exercises and the Google Doc link, and
+append mistakes to the rolling 90-day history for the weekly report.
 
 ## When to run
-Once a day (or manually). Safe to run more than once a day, but see the
-same-day caveat under "Known gotchas".
+Every morning at 08:00 via launchd (`com.maahi.english-daily.plist`). Safe to run
+manually at any time — already-processed pages are skipped automatically.
 
 ## Prerequisites
-- `.env` populated (run `python setup.py` once if not).
-- `NOTION_TOKEN`, `NOTION_WRITING_DB_ID`, `ANTHROPIC_API_KEY`, `GSHEET_MISTAKE_LOG_ID`.
+- `.env` populated: `NOTION_TOKEN`, `NOTION_WRITING_DB_ID`, `ANTHROPIC_API_KEY`,
+  `REPORT_TO_EMAIL`, `GDOC_WRITING_ID` (or `GDOC_JOURNAL_ID`)
+- `token.json` present (Google OAuth — run `python setup.py` once)
 
 ## Tools used (in order)
-1. `tools/state_get.py`        — read `last_writing_sync`
-2. `tools/notion_fetch_writing.py` — fetch entries since that date
-3. `tools/analyze_text.py`     — analyze each entry (Claude)
-4. `tools/sheets_append_mistakes.py` — append mistakes to the Sheet
-5. `tools/state_set.py`        — advance `last_writing_sync`
+1. `tools/state_get.py`             — read `last_writing_sync`
+2. `tools/notion_fetch_writing.py`  — fetch entries since that date (IST midnight filter)
+3. `.tmp/state/processed_pages.json` — skip already-processed page IDs
+4. `tools/analyze_text.py`          — analyze each entry with Claude (Haiku)
+5. `tools/gdoc_append_review.py`    — append mistakes + tutor comment to Writing Journal doc
+6. `tools/compose_daily_exercise.py` — compose HTML email (mistakes + exercises + doc link)
+7. `tools/send_gmail_report.py`     — send the email via Gmail API
+8. `tools/state_set.py`             — advance `last_writing_sync`
+9. `.tmp/state/mistakes_history.json` — append mistakes for weekly report
 
 ## Steps
 
@@ -30,36 +36,65 @@ same-day caveat under "Known gotchas".
    ```bash
    python tools/notion_fetch_writing.py --since "$SINCE" > .tmp/writing_latest.json
    ```
-   If the array is empty, stop here — there's nothing new. Do **not** advance the
-   sync date (so a later entry on the same boundary isn't skipped).
+   Uses IST midnight (`+05:30`) as the filter boundary so entries written after
+   midnight IST (which land on the previous UTC date) are always captured.
 
-3. **Analyze + append each entry**
-   For each element of the array, pipe analysis straight into the Sheet:
+   If the array is empty → send a reminder email and stop. Do **not** advance the
+   sync date.
+
+3. **Skip already-processed pages**
+   Check `.tmp/state/processed_pages.json`. Any `page_id` already in that set is
+   skipped. This prevents duplicate emails on re-runs or timezone edge cases.
+
+4. **Analyze each entry**
    ```bash
-   python tools/analyze_text.py --entry-json <entry>.json --kind writing \
-     | python tools/sheets_append_mistakes.py --stdin
+   python tools/analyze_text.py --entry-json .tmp/entry_daily_00.json --kind writing
    ```
-   `analyze_text.py` also auto-saves `.tmp/analysis_<page_id>.json` for inspection.
+   Returns structured JSON: `mistakes[]`, `patterns[]`, `strengths[]`,
+   `naturalness_score`. If any entry fails, stop — do NOT advance sync date.
 
-4. **Advance the sync date** (only after all entries succeeded)
+5. **Append to Writing Journal Google Doc**
+   ```bash
+   python tools/gdoc_append_review.py \
+     --mistakes-json .tmp/today_mistakes_writing_<date>.json \
+     --date <date> --kind writing [--naturalness <score>]
+   ```
+   Auto-creates the doc on first run and saves `GDOC_WRITING_ID` to `.env`.
+   Returns `{"doc_url": "..."}` used in the email.
+
+6. **Compose and send the email**
+   ```bash
+   python tools/compose_daily_exercise.py \
+     --mistakes-json .tmp/today_mistakes_writing_<date>.json \
+     --date <date> --doc-url <url>
+   python tools/send_gmail_report.py --html-file .tmp/exercise_<date>.html \
+     --subject "Writing Practice — <date> (<N> mistakes)"
+   ```
+   Email contains: yesterday's exercise check, today's mistakes, book unit, new
+   exercises, and a **View Your Writing Journal** button.
+
+7. **Advance state**
    ```bash
    python tools/state_set.py --key last_writing_sync --value $(date +%F)
    ```
+   Also: saves processed `page_id`s, appends mistakes to `mistakes_history.json`.
 
 ## Expected output
-- New rows in the Sheet's `mistakes` tab (one per mistake found).
+- Email in ms4341547@gmail.com with mistakes, exercises, and Journal link.
+- New entry in Writing Journal Google Doc.
 - `last_writing_sync` updated to today.
+- Mistakes appended to `.tmp/state/mistakes_history.json` (feeds weekly report).
 
 ## Error handling
-- **0 entries**: exit clean, leave the sync date untouched.
-- **Claude rate-limit / timeout**: retry that one entry once. If it still fails,
-  skip it and do NOT advance the sync date past it (so it's retried next run).
-- **Empty `text` on an entry**: skip silently (a day with no writing).
-- **Sheet append fails**: stop; the sync date stays put so nothing is lost.
+- **0 new entries**: send reminder email, leave sync date untouched.
+- **All entries already processed**: send reminder email, no analysis.
+- **Claude fails on one entry**: skip it, do NOT advance sync date (retried tomorrow).
+- **Google Doc append fails**: log error, fall back to env-var doc URL in email.
+- **Gmail send fails**: log error, HTML saved in `.tmp/` for manual send.
 
 ## Known gotchas
-- **Same-day re-runs can duplicate.** Entries are filtered by `created_time >= since`,
-  and the sync date is stored at day granularity. If you write and run twice in one
-  day, today's entries may be appended twice. For a once-a-day cron this never happens.
-  A future `sheets_query_mistakes` (M7) can dedupe by `source_ref` if this becomes a problem.
-- `created_time` is stable across edits, so editing an old entry won't re-ingest it.
+- `created_time` in Notion is UTC. Entries written after midnight IST (e.g. 12:30 AM)
+  have a UTC timestamp on the previous calendar day. The IST midnight filter handles
+  this — use `+05:30` offset, not `Z`, in `notion_fetch_writing.py`.
+- Re-runs are safe: `processed_pages.json` prevents double-sending.
+- `created_time` is stable across edits — editing an old entry never re-ingests it.
